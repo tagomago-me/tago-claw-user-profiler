@@ -12,10 +12,6 @@ contradictions, and new candidate behavioral signals.
 
 Requires: OPENAI_API_KEY, NOTION_API_KEY in environment.
 State: /data/memory/profiler-state.json  (key: lastNotionScan)
-
-Note: this scanner currently still does direct LLM analysis. If Mauro provides an
-internal Notion summarizer/agent, this scanner should be replaced by a lighter
-collector/ingestor that consumes that pre-digested output instead.
 """
 
 import sys
@@ -26,7 +22,6 @@ import subprocess
 import ssl
 import urllib.request
 import time
-import hashlib
 from datetime import date, datetime
 
 try:
@@ -40,49 +35,27 @@ STATE_PATH   = '/data/memory/profiler-state.json'
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 MANAGE       = os.path.join(SCRIPT_DIR, 'manage-profile.py')
 MIN_INTERVAL = 3   # days
-ANALYSIS_VERSION = '2026-04-21-c'
 
 NOTION_VERSION       = '2022-06-28'
 READWISE_LIBRARY_DB  = '1ea2c1e8779c8137b03fe00b8b94392e'
 SNIPD_DB             = '1ea2c1e8779c80c48030ddd64a701758'
-
-GENERIC_PREFIXES = (
-    'mauro is interested in',
-    'mauro has an interest in',
-    'mauro is intrigued by',
-    'mauro is involved in',
-    'mauro engages with',
-    'mauro is attentive to',
-    'mauro has a background in',
-    'mauro appreciates',
-    'mauro values',
-    'mauro expresses a preference for',
-)
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 def load_state():
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    state = {}
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH) as f:
-            state = json.load(f)
-    state.setdefault('evidence', {})
-    return state
+            return json.load(f)
+    return {}
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, 'w') as f:
         json.dump(state, f, indent=2)
-    try:
-        subprocess.run(['python3', '/data/userprofile/scripts/sync_profiler_state.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        pass
 
 def too_soon(state, key='lastNotionScan'):
-    if os.environ.get('USER_PROFILER_FORCE_DAILY', '').strip() in {'1', 'true', 'yes', 'on'}:
-        return False
     last = state.get(key)
     return bool(last) and (time.time() - last) / 86400 < MIN_INTERVAL
 
@@ -247,64 +220,6 @@ def fetch_snipd(n_episodes=3, snips_per_episode=4, transcript_lines=6):
     return episodes
 
 
-def filter_unanalyzed_books(state, books):
-    filtered = []
-    evidence_ids = []
-    for book in books:
-        keep = []
-        for highlight in book.get('highlights', []):
-            stable = f'{book.get("title","")}|{book.get("author","")}|{highlight}'
-            evidence_id = 'notion:readwise:' + hashlib.sha1(stable.encode('utf-8')).hexdigest()
-            ensure_evidence_record(state, evidence_id, {
-                'source': 'notion',
-                'kind': 'readwise_highlight',
-                'title': book.get('title'),
-                'author': book.get('author'),
-                'preview': highlight[:280],
-                'content_hash': hashlib.sha1(highlight.encode('utf-8')).hexdigest(),
-                'quote': highlight[:500],
-                'highlight_text': highlight[:500],
-            })
-            if already_analyzed(state, evidence_id):
-                continue
-            keep.append({'evidence_id': evidence_id, 'text': highlight})
-            evidence_ids.append(evidence_id)
-        if keep:
-            filtered.append({'title': book.get('title'), 'author': book.get('author'), 'highlights': keep})
-    return filtered, evidence_ids
-
-
-def filter_unanalyzed_episodes(state, episodes):
-    filtered = []
-    evidence_ids = []
-    for ep in episodes:
-        keep_snips = []
-        for snip in ep.get('snips', []):
-            stable = f'{ep.get("episode","")}|{ep.get("show","")}|{snip.get("title","")}|{" ".join(snip.get("summary", []))}|{snip.get("transcript","")}'
-            evidence_id = 'notion:snipd:' + hashlib.sha1(stable.encode('utf-8')).hexdigest()
-            preview = (snip.get('title', '') + ' ' + ' '.join(snip.get('summary', [])) + ' ' + snip.get('transcript', '')).strip()
-            ensure_evidence_record(state, evidence_id, {
-                'source': 'notion',
-                'kind': 'snipd_snip',
-                'episode': ep.get('episode'),
-                'show': ep.get('show'),
-                'title': snip.get('title'),
-                'preview': preview[:280],
-                'content_hash': hashlib.sha1(preview.encode('utf-8')).hexdigest() if preview else None,
-                'quote': (snip.get('transcript') or snip.get('title') or '')[:500],
-                'transcript_excerpt': (snip.get('transcript') or '')[:500],
-            })
-            if already_analyzed(state, evidence_id):
-                continue
-            enriched = dict(snip)
-            enriched['evidence_id'] = evidence_id
-            keep_snips.append(enriched)
-            evidence_ids.append(evidence_id)
-        if keep_snips:
-            filtered.append({'episode': ep.get('episode'), 'show': ep.get('show'), 'snips': keep_snips})
-    return filtered, evidence_ids
-
-
 # ─── Format for LLM ───────────────────────────────────────────────────────────
 
 def format_readwise(books):
@@ -315,8 +230,7 @@ def format_readwise(books):
     for book in books:
         lines.append(f'"{book["title"]}" by {book["author"]}')
         for h in book['highlights']:
-            lines.append(f'  EVIDENCE_ID: {h["evidence_id"]}')
-            lines.append(f'  • {h["text"]}')
+            lines.append(f'  • {h}')
         lines.append('')
     return '\n'.join(lines)
 
@@ -328,7 +242,6 @@ def format_snipd(episodes):
     for ep in episodes:
         lines.append(f'Podcast: "{ep["episode"]}" ({ep["show"]})')
         for snip in ep['snips']:
-            lines.append(f'  EVIDENCE_ID: {snip["evidence_id"]}')
             lines.append(f'  Snip: {snip["title"]}')
             for bullet in snip['summary']:
                 lines.append(f'    → {bullet}')
@@ -389,56 +302,15 @@ def parse_json(raw):
         print(f'JSON parse error: {e}\nRaw: {raw[:300]}', file=sys.stderr)
         return None
 
-def ensure_evidence_record(state, evidence_id, payload):
-    bucket = state.setdefault('evidence', {})
-    rec = bucket.get(evidence_id, {})
-    rec.update({k: v for k, v in payload.items() if v is not None})
-    bucket[evidence_id] = rec
-    return rec
-
-def already_analyzed(state, evidence_id):
-    rec = state.get('evidence', {}).get(evidence_id, {})
-    return bool(rec.get('analyzed_at') and rec.get('analysis_version') == ANALYSIS_VERSION)
-
-def mark_analyzed(state, evidence_ids):
-    now = time.time()
-    for evidence_id in evidence_ids:
-        rec = state.setdefault('evidence', {}).setdefault(evidence_id, {})
-        rec['analyzed_at'] = now
-        rec['analysis_version'] = ANALYSIS_VERSION
-
-def record_reinforcement(state, source_tag, pattern, evidence, today):
-    bucket = state.setdefault('reinforcements', [])
-    entry = {'source': source_tag, 'pattern': pattern, 'evidence': evidence, 'date': today}
-    for existing in bucket:
-        if existing.get('source') == entry['source'] and existing.get('pattern') == entry['pattern'] and existing.get('evidence') == entry['evidence']:
-            return False
-    bucket.append(entry)
-    return True
-
-def candidate_allowed(text, evidence):
-    t = (text or '').strip()
-    tl = t.lower()
-    ev = (evidence or '').strip()
-    if not t or not ev:
-        return False
-    if len(t.split()) < 6:
-        return False
-    if any(tl.startswith(prefix) for prefix in GENERIC_PREFIXES):
-        return False
-    banned = ('technology', 'innovation', 'storytelling', 'human cognition', 'complex systems', 'scientific advancements')
-    if any(term in tl for term in banned) and 'because' not in tl and 'by ' not in tl and 'when ' not in tl:
-        return False
-    return True
-
 def apply(analysis, today, source_tag):
-    state = load_state()
     counts = {'reinforcements': 0, 'contradictions': 0, 'new_candidates': 0}
     for r in analysis.get('reinforcements', []):
         p, ev = r.get('pattern','').strip(), r.get('evidence','').strip()
         if p and ev:
-            if record_reinforcement(state, source_tag, p, ev, today):
-                counts['reinforcements'] += 1
+            subprocess.run(['python3', MANAGE, 'add-candidate',
+                json.dumps({'text': p, 'evidence': f'[{source_tag}] {ev}',
+                            'source': source_tag, 'date': today})], capture_output=True)
+            counts['reinforcements'] += 1
     for c in analysis.get('contradictions', []):
         a, b = c.get('a','').strip(), c.get('b','').strip()
         if a and b:
@@ -448,18 +320,12 @@ def apply(analysis, today, source_tag):
                             'same_domain': c.get('same_domain', None), 'date': today})], capture_output=True)
             counts['contradictions'] += 1
     for nc in analysis.get('new_candidates', []):
-        t = nc.get('text','').strip()
-        analysis_note = nc.get('analysis','').strip()
-        if candidate_allowed(t, analysis_note):
-            proc = subprocess.run(['python3', MANAGE, 'add-candidate',
-                json.dumps({'text': t,
-                            'analysis': analysis_note,
-                            'source': source_tag, 'date': today,
-                            'evidence_ids': nc.get('evidence_ids', [])})], capture_output=True, text=True)
-            out = (proc.stdout or '') + '\n' + (proc.stderr or '')
-            if proc.returncode == 0 and ('Candidate added:' in out or 'Signal added to existing candidate' in out):
-                counts['new_candidates'] += 1
-    save_state(state)
+        t, ev = nc.get('text','').strip(), nc.get('evidence','').strip()
+        if t and ev:
+            subprocess.run(['python3', MANAGE, 'add-candidate',
+                json.dumps({'text': t, 'evidence': f'[{source_tag}] {ev}',
+                            'source': source_tag, 'date': today})], capture_output=True)
+            counts['new_candidates'] += 1
     return counts
 
 
@@ -490,18 +356,6 @@ def main():
         print('No Notion data fetched.')
         return
 
-    books, book_ids = filter_unanalyzed_books(state, books)
-    episodes, episode_ids = filter_unanalyzed_episodes(state, episodes)
-    pending_ids = book_ids + episode_ids
-    print(f'  {len(pending_ids)} evidence item(s) new to analyze')
-    if not pending_ids:
-        state['lastNotionScan'] = time.time()
-        save_state(state)
-        print('No unanalyzed Notion evidence.')
-        return
-
-    save_state(state)
-
     profile = read_profile()
     evidence = '\n\n'.join(filter(None, [format_readwise(books), format_snipd(episodes)]))
 
@@ -521,22 +375,12 @@ EVIDENCE:
 Look for:
 1. Evidence SUPPORTING an existing pattern (quote the pattern text exactly as in the profile)
 2. Evidence CONTRADICTING an existing pattern
-3. NEW behavioral signals only when they are behaviorally specific and grounded in repeated selection patterns, not just subject matter affinity.
-
-Rules for new_candidates:
-- Good: "Mauro repeatedly selects material that challenges accepted narratives with data.", "Mauro gravitates toward systems-level explanations over isolated facts.", "Mauro clips content that treats scaling as a design problem."
-- Bad: "Mauro is interested in technology.", "Mauro values storytelling.", "Mauro is intrigued by innovation."
-- Infer from what he repeatedly highlights or clips, not from a single topic alone.
-- If the evidence is one-off, generic, or could describe thousands of readers, output nothing.
-- High precision over recall. 0 new candidates is better than a vague one.
+3. NEW behavioral signals not in the profile — grounded in observable choices or repeated interests, never self-description
 
 Return ONLY valid JSON, no markdown, no extra text:
 {{"reinforcements":[{{"pattern":"...","evidence":"..."}}],
   "contradictions":[{{"a":"...","b":"...","evidence_a":"...","evidence_b":"...","same_domain":true}}],
-  "new_candidates":[{{"text":"...","analysis":"short internal rationale, not a quote","evidence_ids":["notion:..."]}}]}}
-
-For any returned item, include the exact supporting evidence ids from the EVIDENCE_ID labels when available.
-For new_candidates, do not paraphrase the source as evidence text. Put your inference in `analysis`, and rely on `evidence_ids` for the primary quote.
+  "new_candidates":[{{"text":"...","evidence":"..."}}]}}
 
 Be conservative. 0 entries in any list is fine. Do not hallucinate."""
 
@@ -549,8 +393,8 @@ Be conservative. 0 entries in any list is fine. Do not hallucinate."""
         return
 
     counts = apply(analysis, today, 'notion')
+    # Reload state to preserve candidates written by manage-profile.py subprocesses
     state = load_state()
-    mark_analyzed(state, pending_ids)
     state['lastNotionScan'] = time.time()
     save_state(state)
 

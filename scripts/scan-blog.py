@@ -20,8 +20,6 @@ import json
 import ssl
 import urllib.request
 import time
-import hashlib
-import subprocess
 from datetime import date, datetime
 from html.parser import HTMLParser
 
@@ -36,7 +34,6 @@ STATE_PATH   = '/data/memory/profiler-state.json'
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 MANAGE       = os.path.join(SCRIPT_DIR, 'manage-profile.py')
 MIN_INTERVAL = 7   # days — blogs update slower than Nostr
-ANALYSIS_VERSION = '2026-04-21-c'
 
 FEEDS = [
     ('tagomago-en', 'https://tagomago.me/feed/'),
@@ -44,43 +41,22 @@ FEEDS = [
 ]
 POSTS_PER_FEED = 5
 
-GENERIC_PREFIXES = (
-    'mauro is interested in',
-    'mauro has an interest in',
-    'mauro is intrigued by',
-    'mauro is involved in',
-    'mauro engages with',
-    'mauro is attentive to',
-    'mauro has a background in',
-    'mauro appreciates',
-    'mauro values',
-    'mauro expresses a preference for',
-)
-
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 def load_state():
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    state = {}
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH) as f:
-            state = json.load(f)
-    state.setdefault('evidence', {})
-    return state
+            return json.load(f)
+    return {}
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, 'w') as f:
         json.dump(state, f, indent=2)
-    try:
-        subprocess.run(['python3', '/data/userprofile/scripts/sync_profiler_state.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        pass
 
 def too_soon(state, key='lastBlogScan'):
-    if os.environ.get('USER_PROFILER_FORCE_DAILY', '').strip() in {'1', 'true', 'yes', 'on'}:
-        return False
     last = state.get(key)
     return bool(last) and (time.time() - last) / 86400 < MIN_INTERVAL
 
@@ -136,16 +112,6 @@ def fetch_feed(url, count=5):
     return posts
 
 
-def make_blog_id(post):
-    link = (post.get('link') or '').strip()
-    title = (post.get('title') or '').strip()
-    pub = (post.get('date') or '').strip()
-    feed = (post.get('feed') or '').strip()
-    canonical = link or f'{feed}|{title}|{pub}'
-    digest = hashlib.sha1(canonical.encode('utf-8')).hexdigest()[:16]
-    return f'blog:{feed}:{digest}'
-
-
 # ─── OpenAI ───────────────────────────────────────────────────────────────────
 
 def call_openai(prompt):
@@ -198,67 +164,16 @@ def parse_json_response(raw):
         print(f'JSON parse error: {e}\nRaw: {raw[:200]}', file=sys.stderr)
         return None
 
-def ensure_evidence_record(state, evidence_id, payload):
-    bucket = state.setdefault('evidence', {})
-    rec = bucket.get(evidence_id, {})
-    rec.update({k: v for k, v in payload.items() if v is not None})
-    bucket[evidence_id] = rec
-    return rec
-
-def already_analyzed(state, evidence_id):
-    rec = state.get('evidence', {}).get(evidence_id, {})
-    return bool(rec.get('analyzed_at') and rec.get('analysis_version') == ANALYSIS_VERSION)
-
-def mark_analyzed(state, evidence_ids):
-    now = time.time()
-    for evidence_id in evidence_ids:
-        rec = state.setdefault('evidence', {}).setdefault(evidence_id, {})
-        rec['analyzed_at'] = now
-        rec['analysis_version'] = ANALYSIS_VERSION
-
-
-def record_reinforcement(state, source_tag, pattern, evidence, today):
-    bucket = state.setdefault('reinforcements', [])
-    entry = {
-        'source': source_tag,
-        'pattern': pattern,
-        'evidence': evidence,
-        'date': today,
-    }
-    for existing in bucket:
-        if (
-            existing.get('source') == entry['source']
-            and existing.get('pattern') == entry['pattern']
-            and existing.get('evidence') == entry['evidence']
-        ):
-            return False
-    bucket.append(entry)
-    return True
-
-def candidate_allowed(text, evidence):
-    t = (text or '').strip()
-    tl = t.lower()
-    ev = (evidence or '').strip()
-    if not t or not ev:
-        return False
-    if len(t.split()) < 6:
-        return False
-    if any(tl.startswith(prefix) for prefix in GENERIC_PREFIXES):
-        return False
-    banned = ('technology', 'innovation', 'storytelling', 'human culture', 'education methods', 'science and entrepreneurship')
-    if any(term in tl for term in banned) and 'because' not in tl and 'by ' not in tl and 'when ' not in tl:
-        return False
-    return True
-
 def apply(analysis, today, source_tag):
     import subprocess
-    state = load_state()
     counts = {'reinforcements': 0, 'contradictions': 0, 'new_candidates': 0}
     for r in analysis.get('reinforcements', []):
         pattern, evidence = r.get('pattern', '').strip(), r.get('evidence', '').strip()
         if pattern and evidence:
-            if record_reinforcement(state, source_tag, pattern, evidence, today):
-                counts['reinforcements'] += 1
+            subprocess.run(['python3', MANAGE, 'add-candidate',
+                json.dumps({'text': pattern, 'evidence': f'[{source_tag}] {evidence}',
+                            'source': source_tag, 'date': today})], capture_output=True)
+            counts['reinforcements'] += 1
     for c in analysis.get('contradictions', []):
         a, b = c.get('a', '').strip(), c.get('b', '').strip()
         if a and b:
@@ -268,18 +183,12 @@ def apply(analysis, today, source_tag):
                             'same_domain': c.get('same_domain', None), 'date': today})], capture_output=True)
             counts['contradictions'] += 1
     for nc in analysis.get('new_candidates', []):
-        text = nc.get('text', '').strip()
-        analysis_note = nc.get('analysis', '').strip()
-        if candidate_allowed(text, analysis_note):
-            proc = subprocess.run(['python3', MANAGE, 'add-candidate',
-                json.dumps({'text': text,
-                            'analysis': analysis_note,
-                            'source': source_tag, 'date': today,
-                            'evidence_ids': nc.get('evidence_ids', [])})], capture_output=True, text=True)
-            out = (proc.stdout or '') + '\n' + (proc.stderr or '')
-            if proc.returncode == 0 and ('Candidate added:' in out or 'Signal added to existing candidate' in out):
-                counts['new_candidates'] += 1
-    save_state(state)
+        text, evidence = nc.get('text', '').strip(), nc.get('evidence', '').strip()
+        if text and evidence:
+            subprocess.run(['python3', MANAGE, 'add-candidate',
+                json.dumps({'text': text, 'evidence': f'[{source_tag}] {evidence}',
+                            'source': source_tag, 'date': today})], capture_output=True)
+            counts['new_candidates'] += 1
     return counts
 
 
@@ -295,52 +204,21 @@ def main():
         return
 
     all_posts = []
-    pending_posts = []
-    pending_ids = []
     for feed_tag, feed_url in FEEDS:
         posts = fetch_feed(feed_url, count=POSTS_PER_FEED)
         print(f'Fetched {len(posts)} posts from {feed_tag}')
         for p in posts:
             p['feed'] = feed_tag
             all_posts.append(p)
-            stable = p.get('link') or f'{feed_tag}:{p.get("title","")}:{p.get("date","")}'
-            blog_id = make_blog_id(p)
-            evidence_id = blog_id
-            body = (p.get('body') or '').strip()
-            ensure_evidence_record(state, evidence_id, {
-                'source': 'blog',
-                'blog_id': blog_id,
-                'feed': feed_tag,
-                'source_id': stable,
-                'title': p.get('title'),
-                'published_at': p.get('date'),
-                'link': p.get('link'),
-                'content_hash': hashlib.sha1(body.encode('utf-8')).hexdigest() if body else None,
-                'preview': body[:280],
-                'quote': body[:500],
-                'body_excerpt': body[:500],
-            })
-            if already_analyzed(state, evidence_id):
-                continue
-            p['_evidence_id'] = evidence_id
-            pending_posts.append(p)
-            pending_ids.append(evidence_id)
 
     if not all_posts:
         print('No blog posts fetched.')
         return
-    if not pending_posts:
-        state['lastBlogScan'] = time.time()
-        save_state(state)
-        print('No unanalyzed blog posts.')
-        return
-
-    save_state(state)
 
     profile = read_profile()
     posts_text = '\n\n---\n\n'.join(
-        f'EVIDENCE_ID: {p.get("_evidence_id")}\n[{p["feed"]}] {p["title"]} ({p["date"]})\n{p["body"]}'
-        for p in pending_posts
+        f'[{p["feed"]}] {p["title"]} ({p["date"]})\n{p["body"]}'
+        for p in all_posts
     )
 
     prompt = f"""You are building a behavioral profile of Mauro from evidence — not self-descriptions.
@@ -356,24 +234,14 @@ EXISTING PROFILE:
 Look for:
 1. Evidence SUPPORTING an existing pattern (quote the pattern exactly)
 2. Evidence CONTRADICTING an existing pattern
-3. NEW behavioral signals only when they are behaviorally specific and grounded in topic choice, framing habit, recurring argument pattern, or persistent tension. Never output broad summaries of subject matter.
+3. NEW behavioral signals (grounded in a topic choice, framing, or observable preference — never a self-description)
 
 Key distinction: blog posts are edited and intentional, unlike Nostr notes. Weight them accordingly — they reflect what he thinks is worth sharing publicly, not spontaneous reactions.
-
-Rules for new_candidates:
-- Good: "Mauro attacks institutional norms by reframing them as control systems.", "Mauro uses public writing to challenge mainstream assumptions.", "Mauro returns to learning-through-play as a serious educational stance."
-- Bad: "Mauro is interested in education.", "Mauro values storytelling.", "Mauro has a background in science and entrepreneurship."
-- Prefer patterns visible in how he frames and argues, not just what topic the post mentions.
-- Self-descriptions in bio/about pages are weak evidence. Ignore them unless strongly reinforced elsewhere.
-- High precision over recall. 0 new candidates is better than a vague one.
 
 Return ONLY valid JSON, no markdown:
 {{"reinforcements":[{{"pattern":"...","evidence":"..."}}],
   "contradictions":[{{"a":"...","b":"...","evidence_a":"...","evidence_b":"...","same_domain":true}}],
-  "new_candidates":[{{"text":"...","analysis":"short internal rationale, not a quote","evidence_ids":["blog:..."]}}]}}
-
-For any returned item, include the exact supporting evidence ids from the EVIDENCE_ID labels when available.
-For new_candidates, do not paraphrase the source as evidence text. Put your inference in `analysis`, and rely on `evidence_ids` for the primary quote.
+  "new_candidates":[{{"text":"...","evidence":"..."}}]}}
 
 Be conservative. 0 entries is fine. No hallucination."""
 
@@ -387,7 +255,6 @@ Be conservative. 0 entries is fine. No hallucination."""
 
     counts = apply(analysis, today, 'blog')
     state = load_state()
-    mark_analyzed(state, pending_ids)
     state['lastBlogScan'] = time.time()
     save_state(state)
 

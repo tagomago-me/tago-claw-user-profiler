@@ -1,131 +1,156 @@
 ---
 name: user-profiler
-description: "Build a behavioral profile of the user from observed decisions and public notes, not self-description. Use after substantial conversations to capture behavior signals, and on heartbeat to scan Nostr notes into trait proposals for human review. Promotion to USER.md happens only after repeated evidence and explicit human validation."
+description: "Build a behavioral profile of the user by observing decisions and Nostr notes — not self-descriptions. Use after a substantial conversation to extract behavioral signals, or on heartbeat to scan Nostr notes for patterns and contradictions. Writes to USER.md only after 4-5 independent signals confirm a pattern. Records contradictions and dilemmas as-is, without resolving them."
 ---
 
 # User Profiler
 
-Build a behavioral profile from evidence, not self-report.
-
-This skill has two active paths:
-1. conversation → candidate signal → human confirmation → promotion to `USER.md`
-2. Nostr note → trait proposal/link in DuckDB → human review → possible promotion to `USER.md`
-
-Do not use `USER.md` as evidence source.
-`USER.md` is the final consolidated output read by the agent.
+Builds a behavioral profile from evidence, not self-report.
+Two distinct jobs — do not mix them.
 
 ---
 
-## Path 1 — conversation signals
+## Job 1 — Post-Conversation Probe
 
-Use after a substantial conversation where Mauro revealed something by decision, tradeoff, repetition, or friction.
+**When:** At the end of a substantial conversation where Mauro made real decisions,
+expressed preferences, or revealed something by what he chose to do or not do.
+Not after small talk or simple task requests.
 
-Good signal types:
-- choice under tradeoff
-- recurring operating preference
-- recurring friction pattern
-- contradiction with previously observed behavior
+**What to look for:**
+- Decisions (especially when something was chosen over something else)
+- Patterns of what he returns to vs what he drops
+- What causes friction vs what flows easily
+- Contradictions with things already in USER.md
 
-Do not capture:
-- self-description without behavioral evidence
-- generic topic interests
-- small talk
+**How to do it (agent runs this internally):**
 
-Flow:
-1. identify 1-3 signals grounded in action
-2. add them with `manage-profile.py add-candidate`
-3. review explicitly with Mauro
-4. approve or reject
-5. only approved patterns go to `USER.md`
+1. Review the conversation just had. Identify 1-3 candidate behavioral signals.
+   A signal must be grounded in an action or decision, not a self-description.
+   Example signal: "Chose to go slower and understand each step rather than get a fast result"
+   Bad signal: "Said he cares about quality"
 
-Pending conversation candidates live in:
-- `/data/memory/profiler-state.json` → `candidates[]`
+2. For each candidate, call:
+   ```bash
+   /data/skills/user-profiler/scripts/manage-profile.py add-candidate \
+     '{"text": "...", "evidence": "brief quote or description of the decision", "source": "conversation", "date": "YYYY-MM-DD"}'
+   ```
+
+3. Show Mauro the candidates in plain language. One at a time. For each:
+   - State the observation
+   - State the evidence it's based on
+   - Ask: "Does this feel accurate?"
+   - If yes → `manage-profile.py approve <id>`
+   - If no → `manage-profile.py reject <id>`
+
+4. After approval, tell him the signal count for that pattern:
+   - If < 4: "Noted. Need more signals before it goes into your profile."
+   - If ≥ 4: "This is now in your profile."
+
+**Never write to USER.md without approval.**
 
 ---
 
-## Path 2 — Nostr trait scan
+## Job 2 — Nostr Scan (Heartbeat, twice/week)
 
-Run:
+**When:** Triggered by heartbeat. Run only if `lastNostrScan` in state is > 3 days ago.
+
 ```bash
 /data/skills/user-profiler/scripts/scan-nostr.py
 ```
 
-Current behavior:
-- reads recent public Nostr notes from the local DuckDB mirror
-- skips obvious operational/test noise
-- in bootstrap mode, proposes at most 1 new trait per note
-- in matching mode, prefers existing validated traits and proposes new ones only when needed
-- writes trait proposals and note↔trait links into DuckDB
-- records enough evidence metadata in operational state to avoid re-analysis
-
-It does not:
-- decide reinforcement vs contradiction against `USER.md`
-- write profile patterns directly to `USER.md`
-- validate traits by itself
-
-Review and promotion happen later.
+- Pulls 5 recent public Nostr notes from Mauro's relays
+- Analyzes with GPT-4o against existing profile
+- No confirmation needed — background work
 
 ---
 
-## Scope
+## Job 3 — Blog Scan (Heartbeat, weekly)
 
-Current production background scan is **Nostr-only**.
+**When:** Triggered by heartbeat. Run only if `lastBlogScan` in state is > 7 days ago.
 
-Backfill rule:
-- do not run backfill headlessly in normal operation
-- if older notes are scanned, Mauro must receive review cards for the resulting proposals
+```bash
+/data/skills/user-profiler/scripts/scan-blog.py
+```
 
----
-
-## Storage model
-
-Canonical data layer:
-- `/data/userprofile/`
-
-Operational state:
-- `/data/memory/profiler-state.json`
-- `/data/.openclaw/user-profiler-review-messages.json`
-
-Final agent-facing output:
-- `/data/USER.md`
-
-Do not version runtime data.
+- Pulls the 5 most recent posts from two RSS feeds:
+  - `tagomago.me/feed/` — main blog, mostly English
+  - `tagomago.me/category/visao/feed/` — Portuguese posts (migrated from VQEB/Closte)
+- Blog posts are treated as **curated, intentional signals** — heavier weight than Nostr notes
+- Analyzes with GPT-4o against existing profile
+- No confirmation needed — background work
 
 ---
 
-## Main files
+## Job 4 — Notion Scan (Heartbeat, twice/week, offset from Nostr)
 
-```text
-skills/user-profiler/
-├── SKILL.md
-├── references/
-│   └── state-flow.md
-└── scripts/
-    ├── manage-profile.py
-    ├── scan-nostr.py
-    ├── send-review-*.py
-    ├── trait-review-batch.py
-    └── user-profiler-cron.sh
+**When:** Triggered by heartbeat. Run only if `lastNotionScan` in state is > 3 days ago.
+
+```bash
+/data/skills/user-profiler/scripts/scan-notion.py
+```
+
+- Pulls highlights from the 3 most recently read **books** (Readwise Library)
+- Pulls snips from the 3 most recently clipped **podcast episodes** (Snipd)
+  - Includes: snip title + AI summary bullets + transcript excerpt per snip
+- Analyzes with GPT-4o against existing profile
+- No confirmation needed — background work
+
+**Databases:**
+- Readwise Library: `1ea2c1e8779c8137b03fe00b8b94392e` (Category = Books)
+- Snipd: `1ea2c1e8779c80c48030ddd64a701758`
+
+---
+
+All background scans report briefly at next conversation: "Nostr scan: N reinforcements, N contradictions, N candidates." Same format for blog and Notion scans.
+
+---
+
+## USER.md Sections (managed by this skill)
+
+The skill appends and maintains two sections in USER.md:
+
+### Observed Patterns
+Behavioral patterns confirmed by 4+ independent signals.
+Pending patterns (< 4 signals) are in `/data/memory/profiler-candidates.json`.
+
+Format:
+```
+## Observed Patterns
+
+- **[pattern statement]** — *N signals* — last: YYYY-MM-DD
+  - [source type]: [brief evidence]
+  - [source type]: [brief evidence]
+```
+
+### Contradictions & Dilemmas
+Tensions between observed behaviors. Not problems to resolve — patterns worth sitting with.
+Includes domain context and whether A and B are from the same life area.
+
+Format:
+```
+## Contradictions & Dilemmas
+
+- **[A] ↔ [B]** — first: YYYY-MM-DD — same domain: yes/no
+  - A: [evidence for A]
+  - B: [evidence for B]
 ```
 
 ---
 
-## Cron behavior
+## Scripts
 
-When triggered by the scheduled user-profiler cron, run the Nostr scan path.
-The reply should say, briefly and in Portuguese:
-1. trait proposals produced
-2. note links produced
-3. whether the run was skipped by interval
-4. or that there were no new candidates today
+```
+skills/user-profiler/
+├── SKILL.md                      ← this file
+└── scripts/
+    ├── manage-profile.py         ← CRUD: candidates, patterns, contradictions in USER.md
+    ├── run-background-scans.py   ← Ordered background scan runner used by cron
+    ├── scan-nostr.py             ← Nostr scan (heartbeat job, state key: lastNostrScan)
+    ├── scan-blog.py              ← Blog scan: tagomago.me EN + PT/VQEB (heartbeat job, state key: lastBlogScan)
+    └── scan-notion.py            ← Readwise + Snipd scan (heartbeat job, state key: lastNotionScan)
+```
 
----
+## State file
 
-## Read the reference when changing
-
-Read `references/state-flow.md` when changing:
-- scanner behavior
-- evidence lifecycle
-- review pipeline
-- storage boundaries
-- promotion rules into `USER.md`
+`/data/memory/profiler-state.json` — tracks candidates and last scan timestamp.
+Created automatically on first run.
